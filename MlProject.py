@@ -1,106 +1,163 @@
-# Import necessary libraries
-import pandas as pd
 import numpy as np
+import pandas as pd
 import matplotlib.pyplot as plt
 import seaborn as sns
-from sklearn.preprocessing import StandardScaler
+import joblib
 from sklearn.decomposition import PCA
 from sklearn.manifold import TSNE
-from sklearn.model_selection import train_test_split
-from sklearn.linear_model import LinearRegression
-from sklearn.metrics import mean_squared_error, r2_score
+from sklearn.model_selection import train_test_split, GridSearchCV, cross_val_score
+from sklearn.preprocessing import MinMaxScaler, StandardScaler
+from sklearn.neural_network import MLPRegressor
 from sklearn.ensemble import RandomForestRegressor
-from sklearn.model_selection import cross_val_score
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+import os
 
-# Load the data
-data = pd.read_csv('hyperspectral_data.csv')  # Replace with the actual file name
+# Load data
+def load_data(file_path):
+    try:
+        df = pd.read_csv(file_path)
+        print("Data loaded successfully.")
+        print("Columns in dataset:", df.columns)
+        return df
+    except Exception as e:
+        print(f"Error loading data: {e}")
+        return None
 
-# Inspect the first few rows of the dataset
-print("First few rows of the dataset:")
-print(data.head())
+# Preprocess data
+def preprocess_data(df, target_column):
+    if df is None:
+        raise ValueError("Dataframe is None. Ensure the file is loaded correctly.")
+    
+    if target_column not in df.columns:
+        raise ValueError(f"Target column '{target_column}' not found in dataset!")
 
-# Check for missing values
-print("\nMissing values in the dataset:")
-print(data.isnull().sum())
+    if 'hsi_id' in df.columns:
+        df = df.drop(columns=['hsi_id'])  # Remove non-numeric column if present
+    
+    df_numeric = df.select_dtypes(include=['number']).copy()
+    df_numeric.fillna(df_numeric.mean(), inplace=True)  # Fill missing values
+    
+    # Outlier Removal using IQR
+    Q1 = df_numeric.quantile(0.25)
+    Q3 = df_numeric.quantile(0.75)
+    IQR = Q3 - Q1
+    df_filtered = df_numeric[~((df_numeric < (Q1 - 1.5 * IQR)) | (df_numeric > (Q3 + 1.5 * IQR))).any(axis=1)].copy()
+    
+    df_filtered = df_filtered.reset_index(drop=True)  # Fix indexing issue
 
-# Handle missing values (if any)
-data = data.fillna(data.mean())  # Replace missing values with the mean of each column
+    # Normalize only the remaining data
+    scaler = MinMaxScaler()
+    df_filtered[df_filtered.columns] = scaler.fit_transform(df_filtered)
+    
+    print("Data preprocessing completed.")
+    return df_filtered
 
-# Check again after filling missing values
-print("\nMissing values after filling with mean:")
-print(data.isnull().sum())
+# Visualize spectral bands
+def visualize_spectral_bands(df):
+    plt.figure(figsize=(10, 6))
+    sns.heatmap(df.corr(), annot=True, cmap='coolwarm', fmt='.2f', linewidths=0.5)
+    plt.title('Correlation Matrix of Spectral Bands')
+    plt.show()
 
-# Preprocessing: Scaling the data (if necessary)
-scaler = StandardScaler()
-data_scaled = scaler.fit_transform(data)
+# Perform PCA
+def apply_pca(df, n_components=2):
+    try:
+        pca = PCA(n_components=n_components)
+        principal_components = pca.fit_transform(df)
+        
+        # Plot Explained Variance
+        plt.figure(figsize=(10, 6))
+        plt.plot(np.cumsum(pca.explained_variance_ratio_))
+        plt.xlabel('Number of Components')
+        plt.ylabel('Explained Variance')
+        plt.title('PCA Explained Variance')
+        plt.show()
+        
+        print("PCA applied successfully.")
+        return principal_components, pca.explained_variance_ratio_
+    except Exception as e:
+        print(f"Error in PCA: {e}")
+        return None, None
 
-# Visualize the first few columns of the dataset
-plt.figure(figsize=(10, 6))
-sns.pairplot(pd.DataFrame(data_scaled, columns=data.columns[:5]))  # Adjust column selection as needed
-plt.show()
+# Perform t-SNE
+def apply_tsne(df, n_components=2, perplexity=30, random_state=42):
+    try:
+        perplexity = min(perplexity, len(df) - 1)
+        tsne = TSNE(n_components=n_components, perplexity=perplexity, random_state=random_state)
+        tsne_results = tsne.fit_transform(df)
+        print("t-SNE applied successfully.")
+        return tsne_results
+    except Exception as e:
+        print(f"Error in t-SNE: {e}")
+        return None
 
-# PCA (for visualization)
-pca = PCA(n_components=2)  # Reducing to 2 components for 2D visualization
-data_pca = pca.fit_transform(data_scaled)
+# Train regression model with checkpointing
+def train_regression_model(X, y, checkpoint_path="best_model.pkl"):
+    try:
+        X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+        
+        param_grid = {
+            'hidden_layer_sizes': [(128, 64), (256, 128)],
+            'activation': ['relu'],
+            'solver': ['adam'],
+            'max_iter': [1000],
+            'early_stopping': [True]
+        }
+        
+        if os.path.exists(checkpoint_path):
+            print("Loading saved model...")
+            best_model = joblib.load(checkpoint_path)
+        else:
+            model = MLPRegressor()
+            grid_search = GridSearchCV(model, param_grid, cv=3, scoring='r2', n_jobs=-1)
+            grid_search.fit(X_train, y_train)
+            
+            best_model = grid_search.best_estimator_
+            joblib.dump(best_model, checkpoint_path)
+        
+        y_pred = best_model.predict(X_test)
+        
+        mae = mean_absolute_error(y_test, y_pred)
+        rmse = mean_squared_error(y_test, y_pred) ** 0.5
+        r2 = r2_score(y_test, y_pred)
+        
+        print("Model training completed.")
+        print(f"Best Model Performance: MAE={mae:.4f}, RMSE={rmse:.4f}, R2={r2:.4f}")
+        
+        # Scatter plot for actual vs predicted
+        plt.figure(figsize=(10, 6))
+        plt.scatter(y_test, y_pred)
+        plt.xlabel("Actual Values")
+        plt.ylabel("Predicted Values")
+        plt.title("Actual vs Predicted DON Concentration")
+        plt.show()
+        
+        return best_model, mae, rmse, r2
+    except Exception as e:
+        print(f"Error in model training: {e}")
+        return None, None, None, None
 
-# Plot the PCA result
-plt.figure(figsize=(10, 6))
-plt.scatter(data_pca[:, 0], data_pca[:, 1], c='blue', edgecolors='k', alpha=0.7)
-plt.title('PCA - 2D Projection of the Data')
-plt.xlabel('Principal Component 1')
-plt.ylabel('Principal Component 2')
-plt.show()
+# Main execution
+def main(file_path, target_column):
+    df = load_data(file_path)
+    df = preprocess_data(df, target_column)
+    
+    X = df.drop(columns=[target_column])
+    y = df[target_column]
+    
+    # Data visualization of spectral bands
+    visualize_spectral_bands(df)
+    
+    # Perform PCA and t-SNE for dimensionality reduction
+    pca_results, _ = apply_pca(X)
+    tsne_results = apply_tsne(X)
+    
+    # Train regression model and evaluate performance
+    model, mae, rmse, r2 = train_regression_model(X, y)
+    
+    print("Pipeline execution completed.")
 
-# t-SNE (for non-linear dimensionality reduction)
-tsne = TSNE(n_components=2, random_state=42)
-data_tsne = tsne.fit_transform(data_scaled)
-
-# Plot the t-SNE result
-plt.figure(figsize=(10, 6))
-plt.scatter(data_tsne[:, 0], data_tsne[:, 1], c='green', edgecolors='k', alpha=0.7)
-plt.title('t-SNE - 2D Projection of the Data')
-plt.xlabel('t-SNE Component 1')
-plt.ylabel('t-SNE Component 2')
-plt.show()
-
-# Model Training (Linear Regression)
-target_column = 'target'  # Replace 'target' with the actual column name
-
-# Separate features (X) and target (y)
-X = data.drop(columns=[target_column])
-y = data[target_column]
-
-# Split the data into training and testing sets
-X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
-
-# Initialize and train the Linear Regression model
-model = LinearRegression()
-model.fit(X_train, y_train)
-
-# Make predictions on the test data
-y_pred = model.predict(X_test)
-
-# Evaluate the model
-mse = mean_squared_error(y_test, y_pred)
-r2 = r2_score(y_test, y_pred)
-
-print(f'Mean Squared Error: {mse}')
-print(f'R-squared: {r2}')
-
-# Initialize and train Random Forest model
-rf_model = RandomForestRegressor(random_state=42)
-rf_model.fit(X_train, y_train)
-
-# Make predictions and evaluate
-rf_pred = rf_model.predict(X_test)
-rf_mse = mean_squared_error(y_test, rf_pred)
-rf_r2 = r2_score(y_test, rf_pred)
-
-print(f'Random Forest Mean Squared Error: {rf_mse}')
-print(f'Random Forest R-squared: {rf_r2}')
-
-
-# Perform cross-validation
-cv_scores = cross_val_score(model, X, y, cv=5)  # 5-fold cross-validation
-print(f'Cross-validation scores: {cv_scores}')
-print(f'Mean cross-validation score: {cv_scores.mean()}')
+if __name__ == "__main__":
+    file_path = "hyperspectral_data.csv"  # Provide correct path to the dataset
+    target_column = "vomitoxin_ppb"  # Update based on your target column name
+    main(file_path, target_column)
